@@ -1,0 +1,22 @@
+{
+  "model_name": "xlm-roberta-base",
+  "labels": [
+    "toxic",
+    "severe_toxic",
+    "obscene",
+    "insult",
+    "threat",
+    "identity_hate"
+  ],
+  "max_tokens": 256,
+  "pos_weight": [
+    5.867204666137695,
+    21.314138412475586,
+    9.382030487060547,
+    9.995956420898438,
+    38.14006805419922,
+    36.603458404541016
+  ],
+  "train_csv": "data\\processed\\jigsaw2018_trainonly_os\\train.csv",
+  "val_csv": "data\\processed\\jigsaw2018_trainonly_os\\val.csv"
+}
