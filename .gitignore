@@ -1,36 +1,25 @@
-# ---- datasets (never commit) ----
+# --- datasets / generated outputs ---
 data/raw/
 data/processed/
-
-# ---- reports / evaluation outputs ----
 reports/
-*.jsonl
-*.csv
 
-# ---- training caches / checkpoints ----
-**/runs/
-**/wandb/
-**/mlruns/
-**/lightning_logs/
-**/__pycache__/
-**/.cache/
-.cache/
-
-# ---- python env stuff ----
+# --- python cache / env ---
+__pycache__/
+*.pyc
 .venv/
 venv/
 .env
 *.log
 
-# ---- OS/editor ----
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-# HuggingFace checkpoints (never commit)
+# --- HF training artifacts ---
 models/**/checkpoint-*/
 models/**/optimizer.pt
-models/**/*.pt
 models/**/scheduler.pt
 models/**/trainer_state.json
 models/**/rng_state.pth
+models/**/*.pt
+
+# --- keep only the final model folder (optional but recommended) ---
+models/*
+!models/xlmr-toxic-v2_1/
+!models/xlmr-toxic-v2_1/**
