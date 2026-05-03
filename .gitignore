@@ -1,0 +1,36 @@
+# ---- datasets (never commit) ----
+data/raw/
+data/processed/
+
+# ---- reports / evaluation outputs ----
+reports/
+*.jsonl
+*.csv
+
+# ---- training caches / checkpoints ----
+**/runs/
+**/wandb/
+**/mlruns/
+**/lightning_logs/
+**/__pycache__/
+**/.cache/
+.cache/
+
+# ---- python env stuff ----
+.venv/
+venv/
+.env
+*.log
+
+# ---- OS/editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+# HuggingFace checkpoints (never commit)
+models/**/checkpoint-*/
+models/**/optimizer.pt
+models/**/*.pt
+models/**/scheduler.pt
+models/**/trainer_state.json
+models/**/rng_state.pth
