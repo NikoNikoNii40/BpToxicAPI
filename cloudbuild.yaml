@@ -7,10 +7,25 @@ steps:
       - -c
       - |
         set -euo pipefail
+        echo "PWD=$(pwd)"
         echo "Downloading model from GCS..."
         mkdir -p models/xlmr-toxic-v2_1
         gsutil -m rsync -r gs://bp-toxicapi-models/models/xlmr-toxic-v2_1 models/xlmr-toxic-v2_1
-        ls -lh models/xlmr-toxic-v2_1/model.safetensors
+
+        echo "Model listing:"
+        ls -lah models/xlmr-toxic-v2_1
+
+        python - <<'PY'
+        from pathlib import Path
+        p = Path("models/xlmr-toxic-v2_1/model.safetensors")
+        b = p.read_bytes()[:64]
+        print("SIZE_BYTES:", p.stat().st_size)
+        print("FIRST_BYTES:", b)
+        if p.stat().st_size < 500_000_000:
+            raise SystemExit("FAIL: model too small (download failed / wrong file)")
+        if b.startswith(b"version https://git-lfs.github.com/spec/v1"):
+            raise SystemExit("FAIL: model is Git LFS pointer, not real safetensors")
+        PY
 
   # 2) Build Docker image (now model exists in context)
   - name: gcr.io/cloud-builders/docker
