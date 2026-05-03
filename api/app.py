@@ -4,6 +4,7 @@ import re
 import time
 import unicodedata
 from typing import Dict, List, Optional, Tuple
+from fastapi.middleware.cors import CORSMiddleware
 
 import torch
 from fastapi import FastAPI, HTTPException, Request
@@ -51,6 +52,13 @@ USER_RE = re.compile(r"@\w+")
 WHITESPACE_RE = re.compile(r"\s+")
 
 app = FastAPI(title="Toxicity Remote Model API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # найпростіше, щоб точно не було "Failed to fetch"
+    allow_credentials=False,      # must be False if allow_origins=["*"]
+    allow_methods=["*"],
+    allow_headers=["*"],          # потрібне для Authorization: Bearer ...
+)
 
 # =========================
 #  In-memory latency stats (privacy-safe)
@@ -105,6 +113,10 @@ class Verdict(BaseModel):
 class PredictResponse(BaseModel):
     scores: Dict[str, float]
     verdict: Verdict
+    meta: Dict[str, object]
+
+class PredictBatchResponse(BaseModel):
+    results: List[PredictResponse]
     meta: Dict[str, object]
 
 # =========================
@@ -304,7 +316,14 @@ async def predict(req: PredictRequest, request: Request):
     strictness = float(req.strictness or 0.5)
     thr = thresholds_for_strictness(strictness)
 
-    texts_in = [req.text] if req.text is not None else (req.texts or [])
+    if req.text is not None:
+        texts_in = [req.text]
+    else:
+        if not req.texts:
+            raise HTTPException(status_code=400, detail="Provide 'text' or 'texts'")
+        if len(req.texts) != 1:
+            raise HTTPException(status_code=400, detail="For multiple texts use /predict_batch")
+        texts_in = [req.texts[0]]
 
     processed: List[str] = []
     for t in texts_in:
@@ -350,6 +369,62 @@ async def predict(req: PredictRequest, request: Request):
         },
     )
 
+@app.post("/predict_batch", response_model=PredictBatchResponse)
+async def predict_batch(req: PredictRequest, request: Request):
+    global LAT_COUNT, LAT_TOTAL_SUM, LAT_MODEL_SUM, LAT_LAST_200_TOTAL, LAT_LAST_200_MODEL
+
+    require_bearer_token(request)
+
+    if not req.texts or len(req.texts) == 0:
+        raise HTTPException(status_code=400, detail="Provide 'texts' (non-empty)")
+
+    strictness = float(req.strictness or 0.5)
+    thr = thresholds_for_strictness(strictness)
+
+    processed = [normalize_text(enforce_char_limit(t)) for t in req.texts]
+
+    t_total_start = time.perf_counter()
+    t_model_start = time.perf_counter()
+
+    scores_list = predict_scores(processed)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+
+    model_latency_ms = int((time.perf_counter() - t_model_start) * 1000)
+    total_latency_ms = int((time.perf_counter() - t_total_start) * 1000)
+
+    # rolling stats
+    LAT_COUNT += 1
+    LAT_TOTAL_SUM += total_latency_ms
+    LAT_MODEL_SUM += model_latency_ms
+    LAT_LAST_200_TOTAL.append(total_latency_ms)
+    LAT_LAST_200_MODEL.append(model_latency_ms)
+    LAT_LAST_200_TOTAL = LAT_LAST_200_TOTAL[-200:]
+    LAT_LAST_200_MODEL = LAT_LAST_200_MODEL[-200:]
+
+    results: List[PredictResponse] = []
+    for scores in scores_list:
+        is_toxic, triggered = compute_verdict(scores, thr)
+        results.append(PredictResponse(
+            scores=scores,
+            verdict=Verdict(is_toxic=is_toxic, triggered_labels=triggered),
+            meta={
+                "mode": "remote",
+                "model_id": MODEL_ID,
+                "threshold_set": THRESHOLD_SET,
+                "model_latency_ms": model_latency_ms,
+                "total_latency_ms": total_latency_ms,
+                "lang": req.lang,
+                "strictness": strictness,
+                "max_chars": MAX_CHARS,
+                "max_tokens": MAX_TOKENS,
+            }
+        ))
+
+    return PredictBatchResponse(
+        results=results,
+        meta={"count": len(results)}
+    )
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
