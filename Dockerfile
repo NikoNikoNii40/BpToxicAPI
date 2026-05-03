@@ -1,10 +1,3 @@
-# --- stage: downloader ---
-FROM gcr.io/google.com/cloudsdktool/cloud-sdk:slim AS downloader
-WORKDIR /dl
-ARG MODEL_GCS=gs://bp-toxicapi-models/models/xlmr-toxic-v2_1
-RUN gsutil -m cp -r ${MODEL_GCS} /dl/xlmr-toxic-v2_1
-
-# --- stage: runtime ---
 FROM python:3.12-slim
 WORKDIR /app
 
@@ -12,7 +5,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY api /app/api
-COPY --from=downloader /dl/xlmr-toxic-v2_1 /app/models/xlmr-toxic-v2_1
+COPY models /app/models
 
 ENV HF_MODEL_PATH=/app/models/xlmr-toxic-v2_1 \
     MODEL_ID=xlmr-toxic-v2_1 \
