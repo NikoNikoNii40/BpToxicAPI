@@ -4,13 +4,37 @@ import re
 import time
 import unicodedata
 from typing import Dict, List, Optional, Tuple
+
 from fastapi.middleware.cors import CORSMiddleware
 
 import torch
+import torch.nn as nn
+from torch.quantization import quantize_dynamic
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
+
+# =========================
+#  Performance / runtime knobs (SAFE)
+# =========================
+
+# Reduce overhead / noise from tokenizers threads
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# Control CPU threading (important on Cloud Run)
+# You can override with env TORCH_THREADS / OMP_NUM_THREADS / MKL_NUM_THREADS
+TORCH_THREADS = int(os.environ.get("TORCH_THREADS", os.environ.get("OMP_NUM_THREADS", "4")))
+TORCH_THREADS = max(1, TORCH_THREADS)
+torch.set_num_threads(TORCH_THREADS)
+torch.set_num_interop_threads(1)
+
+# Optional: enable CPU INT8 dynamic quantization (major speedup on CPU)
+ENABLE_INT8 = os.environ.get("ENABLE_INT8", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# Protect instance from huge batches (prevents spikes / OOM)
+MAX_BATCH = int(os.environ.get("MAX_BATCH", "32"))
 
 # =========================
 #  Configuration (Step 1)
@@ -28,12 +52,11 @@ LABELS: List[str] = [
 MODEL_ID = os.environ.get("MODEL_ID", "xlmr-base-v1")
 THRESHOLD_SET = os.environ.get("THRESHOLD_SET", "per_label_v1")
 
-# Input limits (you can tune later)
+# Input limits
 MAX_CHARS = int(os.environ.get("MAX_CHARS", "4000"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "256"))
 
 # Strictness slider behavior:
-# thresholds_s = clamp(base + (strictness - 0.5) * DELTA, MIN_T, MAX_T)
 STRICTNESS_DELTA = float(os.environ.get("STRICTNESS_DELTA", "0.25"))
 MIN_T = float(os.environ.get("MIN_THRESHOLD", "0.05"))
 MAX_T = float(os.environ.get("MAX_THRESHOLD", "0.95"))
@@ -41,7 +64,7 @@ MAX_T = float(os.environ.get("MAX_THRESHOLD", "0.95"))
 # Optional API auth
 API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN", "").strip()
 
-# HF model path or name (later point this to your fine-tuned checkpoint folder)
+# HF model path or name
 HF_MODEL_PATH = os.environ.get("HF_MODEL_PATH", "xlm-roberta-base")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -54,10 +77,10 @@ WHITESPACE_RE = re.compile(r"\s+")
 app = FastAPI(title="Toxicity Remote Model API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # найпростіше, щоб точно не було "Failed to fetch"
-    allow_credentials=False,      # must be False if allow_origins=["*"]
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],          # потрібне для Authorization: Bearer ...
+    allow_headers=["*"],  # needed for Authorization: Bearer ...
 )
 
 # =========================
@@ -93,7 +116,7 @@ class PredictRequest(BaseModel):
     def validate_texts(cls, v):
         if v is None:
             return v
-        if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+        if (not isinstance(v, list)) or any(not isinstance(x, str) for x in v):
             raise ValueError("texts must be a list of strings")
         return v
 
@@ -114,6 +137,7 @@ class PredictResponse(BaseModel):
     scores: Dict[str, float]
     verdict: Verdict
     meta: Dict[str, object]
+
 
 class PredictBatchResponse(BaseModel):
     results: List[PredictResponse]
@@ -144,7 +168,6 @@ def normalize_text(s: str) -> str:
     s = WHITESPACE_RE.sub(" ", s).strip()
     return s
 
-
 def enforce_char_limit(s: str) -> str:
     if len(s) > MAX_CHARS:
         s = s[:MAX_CHARS]
@@ -164,18 +187,14 @@ def load_base_thresholds() -> Dict[str, float]:
             raise RuntimeError(f"Threshold '{k}' missing in {THRESHOLDS_PATH}")
     return {k: float(data[k]) for k in LABELS}
 
-
 BASE_THRESHOLDS = load_base_thresholds()
-
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-
 def thresholds_for_strictness(strictness: float) -> Dict[str, float]:
     shift = (strictness - 0.5) * STRICTNESS_DELTA
     return {k: clamp(BASE_THRESHOLDS[k] + shift, MIN_T, MAX_T) for k in LABELS}
-
 
 def compute_verdict(scores: Dict[str, float], thresholds: Dict[str, float]) -> Tuple[bool, List[str]]:
     triggered = [k for k in LABELS if float(scores.get(k, 0.0)) >= float(thresholds[k])]
@@ -188,13 +207,20 @@ def compute_verdict(scores: Dict[str, float], thresholds: Dict[str, float]) -> T
 _tokenizer: Optional[AutoTokenizer] = None
 _model: Optional[AutoModelForSequenceClassification] = None
 
-
 def load_model() -> None:
     global _tokenizer, _model
 
+    # GPU hint (safe): can speed matmul on supported GPUs
+    if DEVICE == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+
     _tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH, use_fast=True)
 
-    # Force 6-label multi-label head
     config = AutoConfig.from_pretrained(HF_MODEL_PATH)
     config.num_labels = len(LABELS)
     config.problem_type = "multi_label_classification"
@@ -207,11 +233,25 @@ def load_model() -> None:
         ignore_mismatched_sizes=True,
     )
 
-    _model.to(DEVICE)
-    _model.eval()
+    # Move + (optional) quantize
+    if DEVICE == "cpu":
+        _model = _model.to("cpu")
+        _model.eval()
+
+        if ENABLE_INT8:
+            # BIG CPU speed boost, minimal risk (only quantizes Linear layers)
+            _model = quantize_dynamic(_model, {nn.Linear}, dtype=torch.qint8)
+            _model.eval()
+            print(f"[OK] CPU INT8 quantization enabled (TORCH_THREADS={TORCH_THREADS})")
+        else:
+            print(f"[OK] CPU mode (no quantization) (TORCH_THREADS={TORCH_THREADS})")
+
+    else:
+        _model = _model.to("cuda")
+        _model.eval()
+        print("[OK] CUDA mode enabled")
 
     print(f"[OK] Loaded model '{HF_MODEL_PATH}' with num_labels={_model.config.num_labels} on {DEVICE}")
-
 
 @torch.inference_mode()
 def predict_scores(texts: List[str]) -> List[Dict[str, float]]:
@@ -225,9 +265,15 @@ def predict_scores(texts: List[str]) -> List[Dict[str, float]]:
         max_length=MAX_TOKENS,
         return_tensors="pt",
     )
-    enc = {k: v.to(DEVICE) for k, v in enc.items()}
+
+    if DEVICE == "cuda":
+        enc = {k: v.to("cuda") for k, v in enc.items()}
 
     logits = _model(**enc).logits  # (batch, num_labels)
+
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+
     probs = torch.sigmoid(logits).detach().cpu().tolist()
 
     results: List[Dict[str, float]] = []
@@ -239,20 +285,12 @@ def predict_scores(texts: List[str]) -> List[Dict[str, float]]:
         results.append({LABELS[i]: float(row[i]) for i in range(len(LABELS))})
     return results
 
-
 def warmup_model() -> None:
-    """
-    Warm up CUDA kernels / allocate memory by running a couple of dummy inferences.
-    This reduces cold-start latency for the first real request.
-    """
     try:
         _ = predict_scores(["warmup", "hello world"])
-        if DEVICE == "cuda":
-            torch.cuda.synchronize()
         print("[warmup] done")
     except Exception as e:
         print(f"[warmup] failed: {e}")
-
 
 @app.on_event("startup")
 def _startup() -> None:
@@ -273,15 +311,13 @@ def health():
         "max_chars": MAX_CHARS,
         "max_tokens": MAX_TOKENS,
         "labels": LABELS,
+        "max_batch": MAX_BATCH,
+        "int8_enabled": (DEVICE == "cpu" and ENABLE_INT8),
+        "torch_threads": TORCH_THREADS,
     }
-
 
 @app.get("/stats")
 def stats():
-    """
-    Privacy-safe latency stats (stores only numbers, no text).
-    p95 is estimated from the last 200 requests.
-    """
     if LAT_COUNT == 0:
         return {"count": 0}
 
@@ -289,8 +325,6 @@ def stats():
         if not values:
             return 0
         vals = sorted(values)
-        # "nearest-rank" method:
-        # rank = ceil(0.95 * N) -> 1..N
         import math
         rank = max(1, math.ceil(0.95 * len(vals)))
         return vals[rank - 1]
@@ -302,7 +336,6 @@ def stats():
         "p95_total_ms_last200": p95(LAT_LAST_200_TOTAL),
         "p95_model_ms_last200": p95(LAT_LAST_200_MODEL),
     }
-
 
 @app.post("/predict", response_model=PredictResponse)
 async def predict(req: PredictRequest, request: Request):
@@ -325,23 +358,16 @@ async def predict(req: PredictRequest, request: Request):
             raise HTTPException(status_code=400, detail="For multiple texts use /predict_batch")
         texts_in = [req.texts[0]]
 
-    processed: List[str] = []
-    for t in texts_in:
-        t2 = normalize_text(enforce_char_limit(t))
-        processed.append(t2)
+    processed = [normalize_text(enforce_char_limit(t)) for t in texts_in]
 
-    # ---- latency measurement ----
     t_total_start = time.perf_counter()
-
     t_model_start = time.perf_counter()
-    scores_list = predict_scores(processed)
-    if DEVICE == "cuda":
-        torch.cuda.synchronize()
-    model_latency_ms = int((time.perf_counter() - t_model_start) * 1000)
 
+    scores_list = predict_scores(processed)
+
+    model_latency_ms = int((time.perf_counter() - t_model_start) * 1000)
     total_latency_ms = int((time.perf_counter() - t_total_start) * 1000)
 
-    # Update rolling stats (numbers only)
     LAT_COUNT += 1
     LAT_TOTAL_SUM += total_latency_ms
     LAT_MODEL_SUM += model_latency_ms
@@ -378,6 +404,12 @@ async def predict_batch(req: PredictRequest, request: Request):
     if not req.texts or len(req.texts) == 0:
         raise HTTPException(status_code=400, detail="Provide 'texts' (non-empty)")
 
+    if len(req.texts) > MAX_BATCH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Too many texts in one request. Max is {MAX_BATCH}. (Chunk on client side.)"
+        )
+
     strictness = float(req.strictness or 0.5)
     thr = thresholds_for_strictness(strictness)
 
@@ -387,13 +419,10 @@ async def predict_batch(req: PredictRequest, request: Request):
     t_model_start = time.perf_counter()
 
     scores_list = predict_scores(processed)
-    if DEVICE == "cuda":
-        torch.cuda.synchronize()
 
     model_latency_ms = int((time.perf_counter() - t_model_start) * 1000)
     total_latency_ms = int((time.perf_counter() - t_total_start) * 1000)
 
-    # rolling stats
     LAT_COUNT += 1
     LAT_TOTAL_SUM += total_latency_ms
     LAT_MODEL_SUM += model_latency_ms
@@ -412,6 +441,7 @@ async def predict_batch(req: PredictRequest, request: Request):
                 "mode": "remote",
                 "model_id": MODEL_ID,
                 "threshold_set": THRESHOLD_SET,
+                # note: batch-level latency repeated per item (ok for your extension)
                 "model_latency_ms": model_latency_ms,
                 "total_latency_ms": total_latency_ms,
                 "lang": req.lang,
@@ -421,10 +451,7 @@ async def predict_batch(req: PredictRequest, request: Request):
             }
         ))
 
-    return PredictBatchResponse(
-        results=results,
-        meta={"count": len(results)}
-    )
+    return PredictBatchResponse(results=results, meta={"count": len(results)})
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
