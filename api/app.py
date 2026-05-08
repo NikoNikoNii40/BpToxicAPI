@@ -3,6 +3,7 @@ import os
 import re
 import time
 import unicodedata
+import threading
 from typing import Dict, List, Optional, Tuple
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,20 +21,14 @@ from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTok
 #  Performance / runtime knobs (SAFE)
 # =========================
 
-# Reduce overhead / noise from tokenizers threads
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# Control CPU threading (important on Cloud Run)
-# You can override with env TORCH_THREADS / OMP_NUM_THREADS / MKL_NUM_THREADS
 TORCH_THREADS = int(os.environ.get("TORCH_THREADS", os.environ.get("OMP_NUM_THREADS", "4")))
 TORCH_THREADS = max(1, TORCH_THREADS)
 torch.set_num_threads(TORCH_THREADS)
 torch.set_num_interop_threads(1)
 
-# Optional: enable CPU INT8 dynamic quantization (major speedup on CPU)
 ENABLE_INT8 = os.environ.get("ENABLE_INT8", "1").strip().lower() in ("1", "true", "yes", "on")
-
-# Protect instance from huge batches (prevents spikes / OOM)
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "32"))
 
 # =========================
@@ -52,19 +47,15 @@ LABELS: List[str] = [
 MODEL_ID = os.environ.get("MODEL_ID", "xlmr-base-v1")
 THRESHOLD_SET = os.environ.get("THRESHOLD_SET", "per_label_v1")
 
-# Input limits
 MAX_CHARS = int(os.environ.get("MAX_CHARS", "4000"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "256"))
 
-# Strictness slider behavior:
 STRICTNESS_DELTA = float(os.environ.get("STRICTNESS_DELTA", "0.25"))
 MIN_T = float(os.environ.get("MIN_THRESHOLD", "0.05"))
 MAX_T = float(os.environ.get("MAX_THRESHOLD", "0.95"))
 
-# Optional API auth
 API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN", "").strip()
 
-# HF model path or name
 HF_MODEL_PATH = os.environ.get("HF_MODEL_PATH", "xlm-roberta-base")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -80,8 +71,22 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],  # needed for Authorization: Bearer ...
+    allow_headers=["*"],
 )
+
+# =========================
+#  Model readiness flags (CRITICAL for Cloud Run GPU startup)
+# =========================
+
+MODEL_READY = False
+MODEL_ERROR: Optional[str] = None
+
+def require_ready() -> None:
+    """Return quickly if model still loading; prevents Cloud Run startup probe timeout issues."""
+    if MODEL_ERROR:
+        raise HTTPException(status_code=500, detail=f"Model failed to load: {MODEL_ERROR}")
+    if not MODEL_READY:
+        raise HTTPException(status_code=503, detail="Model is still loading, try again soon.")
 
 # =========================
 #  In-memory latency stats (privacy-safe)
@@ -127,17 +132,14 @@ class PredictRequest(BaseModel):
             return 0.5
         return float(v)
 
-
 class Verdict(BaseModel):
     is_toxic: bool
     triggered_labels: List[str]
-
 
 class PredictResponse(BaseModel):
     scores: Dict[str, float]
     verdict: Verdict
     meta: Dict[str, object]
-
 
 class PredictBatchResponse(BaseModel):
     results: List[PredictResponse]
@@ -149,7 +151,7 @@ class PredictBatchResponse(BaseModel):
 
 def require_bearer_token(request: Request) -> None:
     if not API_BEARER_TOKEN:
-        return  # auth disabled
+        return
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
@@ -233,19 +235,16 @@ def load_model() -> None:
         ignore_mismatched_sizes=True,
     )
 
-    # Move + (optional) quantize
     if DEVICE == "cpu":
         _model = _model.to("cpu")
         _model.eval()
 
         if ENABLE_INT8:
-            # BIG CPU speed boost, minimal risk (only quantizes Linear layers)
             _model = quantize_dynamic(_model, {nn.Linear}, dtype=torch.qint8)
             _model.eval()
             print(f"[OK] CPU INT8 quantization enabled (TORCH_THREADS={TORCH_THREADS})")
         else:
             print(f"[OK] CPU mode (no quantization) (TORCH_THREADS={TORCH_THREADS})")
-
     else:
         _model = _model.to("cuda")
         _model.eval()
@@ -269,7 +268,7 @@ def predict_scores(texts: List[str]) -> List[Dict[str, float]]:
     if DEVICE == "cuda":
         enc = {k: v.to("cuda") for k, v in enc.items()}
 
-    logits = _model(**enc).logits  # (batch, num_labels)
+    logits = _model(**enc).logits
 
     if DEVICE == "cuda":
         torch.cuda.synchronize()
@@ -292,10 +291,29 @@ def warmup_model() -> None:
     except Exception as e:
         print(f"[warmup] failed: {e}")
 
+# =========================
+#  Startup: load in BACKGROUND (prevents GPU startup probe timeout)
+# =========================
+
+def _load_in_background():
+    global MODEL_READY, MODEL_ERROR
+    try:
+        load_model()
+
+        # Warmup can be slow; keep it if you want lower first-request latency.
+        # If GPU startup is still tight, comment the next line out.
+        warmup_model()
+
+        MODEL_READY = True
+        print("[startup] model ready")
+    except Exception as e:
+        MODEL_ERROR = str(e)
+        print("[startup] model load failed:", MODEL_ERROR)
+
 @app.on_event("startup")
 def _startup() -> None:
-    load_model()
-    warmup_model()
+    # IMPORTANT: do not block startup
+    threading.Thread(target=_load_in_background, daemon=True).start()
 
 # =========================
 #  Endpoints
@@ -304,7 +322,8 @@ def _startup() -> None:
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
+        "status": "ok" if MODEL_READY else "loading",
+        "error": MODEL_ERROR,
         "device": DEVICE,
         "model_id": MODEL_ID,
         "hf_model_path": HF_MODEL_PATH,
@@ -339,6 +358,7 @@ def stats():
 
 @app.post("/predict", response_model=PredictResponse)
 async def predict(req: PredictRequest, request: Request):
+    require_ready()
     global LAT_COUNT, LAT_TOTAL_SUM, LAT_MODEL_SUM, LAT_LAST_200_TOTAL, LAT_LAST_200_MODEL
 
     require_bearer_token(request)
@@ -397,6 +417,7 @@ async def predict(req: PredictRequest, request: Request):
 
 @app.post("/predict_batch", response_model=PredictBatchResponse)
 async def predict_batch(req: PredictRequest, request: Request):
+    require_ready()
     global LAT_COUNT, LAT_TOTAL_SUM, LAT_MODEL_SUM, LAT_LAST_200_TOTAL, LAT_LAST_200_MODEL
 
     require_bearer_token(request)
@@ -441,7 +462,6 @@ async def predict_batch(req: PredictRequest, request: Request):
                 "mode": "remote",
                 "model_id": MODEL_ID,
                 "threshold_set": THRESHOLD_SET,
-                # note: batch-level latency repeated per item (ok for your extension)
                 "model_latency_ms": model_latency_ms,
                 "total_latency_ms": total_latency_ms,
                 "lang": req.lang,
