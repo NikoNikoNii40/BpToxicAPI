@@ -28,11 +28,20 @@ TORCH_THREADS = max(1, TORCH_THREADS)
 torch.set_num_threads(TORCH_THREADS)
 torch.set_num_interop_threads(1)
 
+# Optional CPU INT8 dynamic quantization
 ENABLE_INT8 = os.environ.get("ENABLE_INT8", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# Protect instance from huge batches
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "32"))
 
+# Warmup can create contention / slow first real traffic. Default OFF on Cloud Run.
+ENABLE_WARMUP = os.environ.get("ENABLE_WARMUP", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# FP16 autocast on CUDA for speed (safe for classification). Default ON.
+ENABLE_FP16 = os.environ.get("ENABLE_FP16", "1").strip().lower() in ("1", "true", "yes", "on")
+
 # =========================
-#  Configuration (Step 1)
+#  Configuration
 # =========================
 
 LABELS: List[str] = [
@@ -57,9 +66,12 @@ MAX_T = float(os.environ.get("MAX_THRESHOLD", "0.95"))
 API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN", "").strip()
 
 HF_MODEL_PATH = os.environ.get("HF_MODEL_PATH", "xlm-roberta-base")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 THRESHOLDS_PATH = os.environ.get("THRESHOLDS_PATH", "thresholds.json")
+
+# IMPORTANT:
+# Do NOT call torch.cuda.is_available() at import time (Cloud Run GPU startup probe risk).
+REQUESTED_DEVICE = os.environ.get("DEVICE", "auto").strip().lower()
+DEVICE = "cpu"  # will be resolved in background load
 
 URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 USER_RE = re.compile(r"@\w+")
@@ -75,21 +87,20 @@ app.add_middleware(
 )
 
 # =========================
-#  Model readiness flags (CRITICAL for Cloud Run GPU startup)
+#  Model readiness flags
 # =========================
 
 MODEL_READY = False
 MODEL_ERROR: Optional[str] = None
 
 def require_ready() -> None:
-    """Return quickly if model still loading; prevents Cloud Run startup probe timeout issues."""
     if MODEL_ERROR:
         raise HTTPException(status_code=500, detail=f"Model failed to load: {MODEL_ERROR}")
     if not MODEL_READY:
         raise HTTPException(status_code=503, detail="Model is still loading, try again soon.")
 
 # =========================
-#  In-memory latency stats (privacy-safe)
+#  In-memory latency stats
 # =========================
 LAT_COUNT = 0
 LAT_TOTAL_SUM = 0
@@ -209,10 +220,20 @@ def compute_verdict(scores: Dict[str, float], thresholds: Dict[str, float]) -> T
 _tokenizer: Optional[AutoTokenizer] = None
 _model: Optional[AutoModelForSequenceClassification] = None
 
-def load_model() -> None:
-    global _tokenizer, _model
+def _resolve_device() -> str:
+    # Called only in background thread.
+    if REQUESTED_DEVICE in ("cpu",):
+        return "cpu"
+    if REQUESTED_DEVICE in ("cuda", "gpu"):
+        return "cuda"
+    # auto:
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
-    # GPU hint (safe): can speed matmul on supported GPUs
+def load_model() -> None:
+    global _tokenizer, _model, DEVICE
+
+    DEVICE = _resolve_device()
+
     if DEVICE == "cuda":
         try:
             torch.set_float32_matmul_precision("high")
@@ -236,18 +257,14 @@ def load_model() -> None:
     )
 
     if DEVICE == "cpu":
-        _model = _model.to("cpu")
-        _model.eval()
-
+        _model = _model.to("cpu").eval()
         if ENABLE_INT8:
-            _model = quantize_dynamic(_model, {nn.Linear}, dtype=torch.qint8)
-            _model.eval()
+            _model = quantize_dynamic(_model, {nn.Linear}, dtype=torch.qint8).eval()
             print(f"[OK] CPU INT8 quantization enabled (TORCH_THREADS={TORCH_THREADS})")
         else:
             print(f"[OK] CPU mode (no quantization) (TORCH_THREADS={TORCH_THREADS})")
     else:
-        _model = _model.to("cuda")
-        _model.eval()
+        _model = _model.to("cuda").eval()
         print("[OK] CUDA mode enabled")
 
     print(f"[OK] Loaded model '{HF_MODEL_PATH}' with num_labels={_model.config.num_labels} on {DEVICE}")
@@ -257,21 +274,28 @@ def predict_scores(texts: List[str]) -> List[Dict[str, float]]:
     if _tokenizer is None or _model is None:
         raise RuntimeError("Model not loaded yet")
 
-    enc = _tokenizer(
-        texts,
+    tok_kwargs = dict(
         padding=True,
         truncation=True,
         max_length=MAX_TOKENS,
         return_tensors="pt",
     )
+    # Small GPU perf win
+    if DEVICE == "cuda":
+        tok_kwargs["pad_to_multiple_of"] = 8
+
+    enc = _tokenizer(texts, **tok_kwargs)
 
     if DEVICE == "cuda":
-        enc = {k: v.to("cuda") for k, v in enc.items()}
+        enc = {k: v.to("cuda", non_blocking=True) for k, v in enc.items()}
 
-    logits = _model(**enc).logits
-
-    if DEVICE == "cuda":
-        torch.cuda.synchronize()
+        if ENABLE_FP16:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                logits = _model(**enc).logits
+        else:
+            logits = _model(**enc).logits
+    else:
+        logits = _model(**enc).logits
 
     probs = torch.sigmoid(logits).detach().cpu().tolist()
 
@@ -287,32 +311,33 @@ def predict_scores(texts: List[str]) -> List[Dict[str, float]]:
 def warmup_model() -> None:
     try:
         _ = predict_scores(["warmup", "hello world"])
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
         print("[warmup] done")
     except Exception as e:
         print(f"[warmup] failed: {e}")
 
 # =========================
-#  Startup: load in BACKGROUND (prevents GPU startup probe timeout)
+#  Startup: load in BACKGROUND
 # =========================
 
 def _load_in_background():
     global MODEL_READY, MODEL_ERROR
     try:
         load_model()
+        MODEL_READY = True  # become ready immediately after load
 
-        # Warmup can be slow; keep it if you want lower first-request latency.
-        # If GPU startup is still tight, comment the next line out.
-        warmup_model()
+        if ENABLE_WARMUP:
+            warmup_model()
 
-        MODEL_READY = True
         print("[startup] model ready")
     except Exception as e:
         MODEL_ERROR = str(e)
+        MODEL_READY = False
         print("[startup] model load failed:", MODEL_ERROR)
 
 @app.on_event("startup")
 def _startup() -> None:
-    # IMPORTANT: do not block startup
     threading.Thread(target=_load_in_background, daemon=True).start()
 
 # =========================
@@ -332,6 +357,8 @@ def health():
         "labels": LABELS,
         "max_batch": MAX_BATCH,
         "int8_enabled": (DEVICE == "cpu" and ENABLE_INT8),
+        "fp16_enabled": (DEVICE == "cuda" and ENABLE_FP16),
+        "warmup_enabled": ENABLE_WARMUP,
         "torch_threads": TORCH_THREADS,
     }
 
@@ -358,10 +385,10 @@ def stats():
 
 @app.post("/predict", response_model=PredictResponse)
 async def predict(req: PredictRequest, request: Request):
-    require_ready()
     global LAT_COUNT, LAT_TOTAL_SUM, LAT_MODEL_SUM, LAT_LAST_200_TOTAL, LAT_LAST_200_MODEL
 
     require_bearer_token(request)
+    require_ready()
 
     if req.text is None and (req.texts is None or len(req.texts) == 0):
         raise HTTPException(status_code=400, detail="Provide 'text' or 'texts'")
@@ -384,6 +411,8 @@ async def predict(req: PredictRequest, request: Request):
     t_model_start = time.perf_counter()
 
     scores_list = predict_scores(processed)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
 
     model_latency_ms = int((time.perf_counter() - t_model_start) * 1000)
     total_latency_ms = int((time.perf_counter() - t_total_start) * 1000)
@@ -417,19 +446,16 @@ async def predict(req: PredictRequest, request: Request):
 
 @app.post("/predict_batch", response_model=PredictBatchResponse)
 async def predict_batch(req: PredictRequest, request: Request):
-    require_ready()
     global LAT_COUNT, LAT_TOTAL_SUM, LAT_MODEL_SUM, LAT_LAST_200_TOTAL, LAT_LAST_200_MODEL
 
     require_bearer_token(request)
+    require_ready()
 
     if not req.texts or len(req.texts) == 0:
         raise HTTPException(status_code=400, detail="Provide 'texts' (non-empty)")
 
     if len(req.texts) > MAX_BATCH:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Too many texts in one request. Max is {MAX_BATCH}. (Chunk on client side.)"
-        )
+        raise HTTPException(status_code=413, detail=f"Too many texts. Max is {MAX_BATCH}.")
 
     strictness = float(req.strictness or 0.5)
     thr = thresholds_for_strictness(strictness)
@@ -440,6 +466,8 @@ async def predict_batch(req: PredictRequest, request: Request):
     t_model_start = time.perf_counter()
 
     scores_list = predict_scores(processed)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
 
     model_latency_ms = int((time.perf_counter() - t_model_start) * 1000)
     total_latency_ms = int((time.perf_counter() - t_total_start) * 1000)
@@ -455,21 +483,23 @@ async def predict_batch(req: PredictRequest, request: Request):
     results: List[PredictResponse] = []
     for scores in scores_list:
         is_toxic, triggered = compute_verdict(scores, thr)
-        results.append(PredictResponse(
-            scores=scores,
-            verdict=Verdict(is_toxic=is_toxic, triggered_labels=triggered),
-            meta={
-                "mode": "remote",
-                "model_id": MODEL_ID,
-                "threshold_set": THRESHOLD_SET,
-                "model_latency_ms": model_latency_ms,
-                "total_latency_ms": total_latency_ms,
-                "lang": req.lang,
-                "strictness": strictness,
-                "max_chars": MAX_CHARS,
-                "max_tokens": MAX_TOKENS,
-            }
-        ))
+        results.append(
+            PredictResponse(
+                scores=scores,
+                verdict=Verdict(is_toxic=is_toxic, triggered_labels=triggered),
+                meta={
+                    "mode": "remote",
+                    "model_id": MODEL_ID,
+                    "threshold_set": THRESHOLD_SET,
+                    "model_latency_ms": model_latency_ms,
+                    "total_latency_ms": total_latency_ms,
+                    "lang": req.lang,
+                    "strictness": strictness,
+                    "max_chars": MAX_CHARS,
+                    "max_tokens": MAX_TOKENS,
+                },
+            )
+        )
 
     return PredictBatchResponse(results=results, meta={"count": len(results)})
 
