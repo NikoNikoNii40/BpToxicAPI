@@ -17,10 +17,8 @@ from transformers import (
 
 LABELS = ["toxic", "severe_toxic", "obscene", "insult", "threat", "identity_hate"]
 
-
 def sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
-
 
 def load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -37,12 +35,9 @@ def load_csv(path: Path) -> pd.DataFrame:
         df[c] = df[c].fillna(0).astype(int)
     return df
 
-
 def to_hf_dataset(df: pd.DataFrame) -> Dataset:
-    # HF Trainer expects labels as float tensor for multi-label BCE loss
     labels = df[LABELS].values.astype(np.float32).tolist()
     return Dataset.from_dict({"text": df["text"].tolist(), "labels": labels})
-
 
 def compute_pos_weight(train_df: pd.DataFrame) -> torch.Tensor:
     # pos_weight = neg/pos for BCEWithLogitsLoss
@@ -51,11 +46,10 @@ def compute_pos_weight(train_df: pd.DataFrame) -> torch.Tensor:
     pos_weight = []
     for p, n in zip(pos, neg):
         if p <= 0:
-            pos_weight.append(1.0)  # avoid inf if label never appears
+            pos_weight.append(1.0)  
         else:
             pos_weight.append(float(n / p))
     return torch.tensor(pos_weight, dtype=torch.float32)
-
 
 class WeightedTrainer(Trainer):
     def __init__(self, *args, pos_weight: torch.Tensor, **kwargs):
@@ -66,33 +60,24 @@ class WeightedTrainer(Trainer):
         labels = inputs.get("labels")
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         logits = outputs.logits
-
-        # BCEWithLogitsLoss for multi-label
         loss_fct = torch.nn.BCEWithLogitsLoss(pos_weight=self._pos_weight.to(logits.device))
         loss = loss_fct(logits, labels)
 
         return (loss, outputs) if return_outputs else loss
-
 
 def build_metrics_fn() -> callable:
     def compute_metrics(eval_pred) -> Dict[str, float]:
         logits, labels = eval_pred
         probs = sigmoid(np.array(logits))
         y_true = np.array(labels).astype(int)
-
-        # default threshold 0.5 for reporting during training
         y_pred = (probs >= 0.5).astype(int)
-
         metrics = {}
         metrics["macro_f1"] = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
         metrics["micro_f1"] = float(f1_score(y_true, y_pred, average="micro", zero_division=0))
         metrics["hamming_loss"] = float(hamming_loss(y_true, y_pred))
-
-        # per-label F1
         for i, lab in enumerate(LABELS):
             metrics[f"f1_{lab}"] = float(f1_score(y_true[:, i], y_pred[:, i], zero_division=0))
 
-        # PR-AUC (Average Precision) per label + macro
         ap_list = []
         for i, lab in enumerate(LABELS):
             try:
@@ -107,7 +92,6 @@ def build_metrics_fn() -> callable:
 
     return compute_metrics
 
-
 def tokenize_fn(tokenizer, max_tokens: int):
     def tok(batch):
         return tokenizer(
@@ -117,7 +101,6 @@ def tokenize_fn(tokenizer, max_tokens: int):
             padding=False,
         )
     return tok
-
 
 def main():
     p = argparse.ArgumentParser()
@@ -133,25 +116,18 @@ def main():
     p.add_argument("--warmup_ratio", type=float, default=0.06)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
-
     train_csv = Path(args.train_csv)
     val_csv = Path(args.val_csv)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     train_df = load_csv(train_csv)
     val_df = load_csv(val_csv)
-
     pos_weight = compute_pos_weight(train_df)
-
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-
     train_ds = to_hf_dataset(train_df).map(tokenize_fn(tokenizer, args.max_tokens), batched=True)
     val_ds = to_hf_dataset(val_df).map(tokenize_fn(tokenizer, args.max_tokens), batched=True)
-
     train_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     val_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
-
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name,
         num_labels=len(LABELS),
@@ -179,7 +155,6 @@ def main():
         dataloader_pin_memory=True,
     )
 
-    # Transformers v4 uses evaluation_strategy, v5 uses eval_strategy
     try:
         train_args = TrainingArguments(**common_args, evaluation_strategy="epoch")
     except TypeError:
@@ -197,11 +172,8 @@ def main():
     )
 
     trainer.train()
-
     trainer.save_model(str(out_dir))
     tokenizer.save_pretrained(str(out_dir))
-
-    # Save training metadata for reproducibility
     meta = {
         "model_name": args.model_name,
         "labels": LABELS,
@@ -212,7 +184,7 @@ def main():
     }
     (out_dir / "training_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    print(f"✅ Saved checkpoint: {out_dir}")
+    print(f"Saved checkpoint: {out_dir}")
 
 
 if __name__ == "__main__":

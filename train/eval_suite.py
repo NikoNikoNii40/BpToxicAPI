@@ -2,7 +2,6 @@ import argparse
 import json
 from pathlib import Path
 from typing import Dict, List
-
 import numpy as np
 import pandas as pd
 import torch
@@ -11,10 +10,8 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 LABELS = ["toxic", "severe_toxic", "obscene", "insult", "threat", "identity_hate"]
 
-
 def sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
-
 
 def load_multi_label_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -29,7 +26,6 @@ def load_multi_label_csv(path: Path) -> pd.DataFrame:
     for c in LABELS:
         df[c] = df[c].fillna(0).astype(int)
     return df
-
 
 @torch.inference_mode()
 def predict_probs(model, tokenizer, texts: List[str], max_tokens: int, device: str, batch_size: int) -> np.ndarray:
@@ -48,7 +44,6 @@ def predict_probs(model, tokenizer, texts: List[str], max_tokens: int, device: s
         all_probs.append(sigmoid(logits))
     return np.vstack(all_probs)
 
-
 def eval_multilabel(y_true: np.ndarray, probs: np.ndarray, thresholds: Dict[str, float]) -> Dict[str, float]:
     thr = np.array([thresholds[l] for l in LABELS], dtype=np.float32)
     y_pred = (probs >= thr).astype(int)
@@ -66,14 +61,12 @@ def eval_multilabel(y_true: np.ndarray, probs: np.ndarray, thresholds: Dict[str,
             out[f"ap_{lab}"] = 0.0
     return out
 
-
 def load_thresholds(path: Path) -> Dict[str, float]:
     d = json.loads(path.read_text(encoding="utf-8"))
     for lab in LABELS:
         if lab not in d:
             d[lab] = 0.5
     return {k: float(d[k]) for k in LABELS}
-
 
 def eval_multilingual_toxic_only(multilingual_csv: Path, probs_toxic: np.ndarray) -> Dict[str, float]:
     """
@@ -102,7 +95,6 @@ def eval_multilingual_toxic_only(multilingual_csv: Path, probs_toxic: np.ndarray
     pred = (probs_toxic >= 0.5).astype(int)
     out["toxic_f1@0.5"] = float(f1_score(y, pred, zero_division=0))
     return out
-
 
 def unintended_bias_metrics(df: pd.DataFrame, toxic_probs: np.ndarray, identities: List[str],
                            min_count: int = 50, identity_threshold: float = 0.5) -> Dict[str, float]:
@@ -191,29 +183,21 @@ def load_unintended_bias_subset(
     - optional filter by split column (e.g. 'test')
     - samples down to bias_max_rows
     """
-    # choose ground truth columns we might use
     gt_candidates = ["target", "toxicity", "toxic", "label"]
-
     usecols = ["comment_text", "split"] + gt_candidates + identity_cols
-    # Some files may not contain all usecols -> filter to existing after reading header
     header = pd.read_csv(csv_path, nrows=0)
     existing = [c for c in usecols if c in header.columns]
-
     read_kwargs = dict(usecols=existing, low_memory=False)
     if bias_read_rows and bias_read_rows > 0:
         read_kwargs["nrows"] = bias_read_rows
 
     df = pd.read_csv(csv_path, **read_kwargs)
-
-    # Optional split filter
     if bias_split and "split" in df.columns:
         df = df[df["split"].astype(str) == bias_split].copy()
 
-    # Sample down
     if bias_max_rows and bias_max_rows > 0 and len(df) > bias_max_rows:
         df = df.sample(n=bias_max_rows, random_state=bias_seed).reset_index(drop=True)
 
-    # Ensure comment_text exists
     if "comment_text" not in df.columns:
         raise ValueError("Bias CSV missing 'comment_text' column.")
 
@@ -227,12 +211,9 @@ def main():
     p.add_argument("--thresholds", default="api/thresholds.json")
     p.add_argument("--max_tokens", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=16)
-
     p.add_argument("--jigsaw_val", default="data/processed/jigsaw2018/val.csv")
     p.add_argument("--multilingual_validation", default="data/raw/jigsaw2020_multi/validation.csv")
     p.add_argument("--unintended_bias_all", default="data/raw/jigsaw2019_bias/all_data.csv")
-
-    # Bias controls
     p.add_argument("--bias_max_rows", type=int, default=50000,
                    help="Max rows used for bias evaluation after filtering (0 = no cap).")
     p.add_argument("--bias_read_rows", type=int, default=300000,
@@ -240,20 +221,15 @@ def main():
     p.add_argument("--bias_seed", type=int, default=42)
     p.add_argument("--bias_split", default="test",
                    help="If CSV has 'split' column, use this split (e.g. 'test' or 'train'). Empty to disable.")
-
     p.add_argument("--report_out", default="reports/metrics_remote.json")
     args = p.parse_args()
-
     model_dir = Path(args.model_dir)
     thresholds_path = Path(args.thresholds)
-
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), use_fast=True)
     model = AutoModelForSequenceClassification.from_pretrained(str(model_dir))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
-
     thresholds = load_thresholds(thresholds_path)
-
     report = {
         "model_dir": str(model_dir),
         "thresholds": thresholds,
@@ -262,13 +238,10 @@ def main():
         "batch_size": args.batch_size,
     }
 
-    # 1) Jigsaw2018 validation (multi-label)
     jigsaw_val = load_multi_label_csv(Path(args.jigsaw_val))
     probs = predict_probs(model, tokenizer, jigsaw_val["text"].tolist(), args.max_tokens, device, args.batch_size)
     y = jigsaw_val[LABELS].values.astype(int)
     report["jigsaw2018_val"] = eval_multilabel(y, probs, thresholds)
-
-    # 2) Multilingual (toxic-only evaluation)
     mpath = Path(args.multilingual_validation)
     if mpath.exists():
         mdf = pd.read_csv(mpath)
@@ -287,7 +260,6 @@ def main():
     else:
         report["multilingual_toxic_only"] = {"note": "multilingual validation.csv not found, skipped."}
 
-    # 3) Unintended Bias (toxicity-only fairness metrics)
     bias_path = Path(args.unintended_bias_all)
     if bias_path.exists():
         identity_cols = [
@@ -318,7 +290,6 @@ def main():
         texts = bdf["comment_text"].tolist()
         bprobs = predict_probs(model, tokenizer, texts, args.max_tokens, device, args.batch_size)
         toxic_probs = bprobs[:, 0]
-
         report["unintended_bias_toxic_only"] = unintended_bias_metrics(
             bdf, toxic_probs, identity_cols, min_count=50, identity_threshold=0.5
         )
@@ -328,8 +299,7 @@ def main():
     out = Path(args.report_out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"✅ Saved report: {out}")
-
+    print(f"Saved report: {out}")
 
 if __name__ == "__main__":
     main()

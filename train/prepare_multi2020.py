@@ -14,17 +14,14 @@ def main():
     OUT.parent.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(RAW)
 
-    # Normalize column name to 'text' if needed
     if "text" not in df.columns and "comment_text" in df.columns:
         df = df.rename(columns={"comment_text": "text"})
 
-    # Keep only what we need for toxic-only evaluation
     keep = [c for c in ["text", "toxic"] if c in df.columns]
     df = df[keep].copy()
     df["text"] = df["text"].fillna("").astype(str)
-
     df.to_csv(OUT, index=False)
-    print(f"✅ Saved multilingual eval file: {OUT} (rows={len(df)})")
+    print(f"Saved multilingual eval file: {OUT} (rows={len(df)})")
 
 if __name__ == "__main__":
     main()

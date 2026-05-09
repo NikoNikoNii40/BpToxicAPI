@@ -5,44 +5,32 @@ import time
 import unicodedata
 import threading
 from typing import Dict, List, Optional, Tuple
-
 from fastapi.middleware.cors import CORSMiddleware
-
 import torch
 import torch.nn as nn
 from torch.quantization import quantize_dynamic
-
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
-# =========================
+# ===============================================================================================================================================
 #  Performance / runtime knobs (SAFE)
-# =========================
+# ===============================================================================================================================================
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
 TORCH_THREADS = int(os.environ.get("TORCH_THREADS", os.environ.get("OMP_NUM_THREADS", "4")))
 TORCH_THREADS = max(1, TORCH_THREADS)
 torch.set_num_threads(TORCH_THREADS)
 torch.set_num_interop_threads(1)
-
-# Optional CPU INT8 dynamic quantization
 ENABLE_INT8 = os.environ.get("ENABLE_INT8", "1").strip().lower() in ("1", "true", "yes", "on")
-
-# Protect instance from huge batches
 MAX_BATCH = int(os.environ.get("MAX_BATCH", "32"))
-
-# Warmup can create contention / slow first real traffic. Default OFF on Cloud Run.
 ENABLE_WARMUP = os.environ.get("ENABLE_WARMUP", "0").strip().lower() in ("1", "true", "yes", "on")
-
-# FP16 autocast on CUDA for speed (safe for classification). Default ON.
 ENABLE_FP16 = os.environ.get("ENABLE_FP16", "1").strip().lower() in ("1", "true", "yes", "on")
 
-# =========================
+# ===============================================================================================================================================
 #  Configuration
-# =========================
+# ===============================================================================================================================================
 
 LABELS: List[str] = [
     "toxic",
@@ -55,28 +43,19 @@ LABELS: List[str] = [
 
 MODEL_ID = os.environ.get("MODEL_ID", "xlmr-base-v1")
 THRESHOLD_SET = os.environ.get("THRESHOLD_SET", "per_label_v1")
-
 MAX_CHARS = int(os.environ.get("MAX_CHARS", "4000"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "256"))
-
 STRICTNESS_DELTA = float(os.environ.get("STRICTNESS_DELTA", "0.25"))
 MIN_T = float(os.environ.get("MIN_THRESHOLD", "0.05"))
 MAX_T = float(os.environ.get("MAX_THRESHOLD", "0.95"))
-
 API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN", "").strip()
-
 HF_MODEL_PATH = os.environ.get("HF_MODEL_PATH", "xlm-roberta-base")
 THRESHOLDS_PATH = os.environ.get("THRESHOLDS_PATH", "thresholds.json")
-
-# IMPORTANT:
-# Do NOT call torch.cuda.is_available() at import time (Cloud Run GPU startup probe risk).
 REQUESTED_DEVICE = os.environ.get("DEVICE", "auto").strip().lower()
-DEVICE = "cpu"  # will be resolved in background load
-
+DEVICE = "cpu" 
 URL_RE = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 USER_RE = re.compile(r"@\w+")
 WHITESPACE_RE = re.compile(r"\s+")
-
 app = FastAPI(title="Toxicity Remote Model API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -86,31 +65,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
+# ===============================================================================================================================================
 #  Model readiness flags
-# =========================
+# ===============================================================================================================================================
 
 MODEL_READY = False
 MODEL_ERROR: Optional[str] = None
-
 def require_ready() -> None:
     if MODEL_ERROR:
         raise HTTPException(status_code=500, detail=f"Model failed to load: {MODEL_ERROR}")
     if not MODEL_READY:
         raise HTTPException(status_code=503, detail="Model is still loading, try again soon.")
 
-# =========================
+# ===============================================================================================================================================
 #  In-memory latency stats
-# =========================
+# ===============================================================================================================================================
 LAT_COUNT = 0
 LAT_TOTAL_SUM = 0
 LAT_MODEL_SUM = 0
 LAT_LAST_200_TOTAL: List[int] = []
 LAT_LAST_200_MODEL: List[int] = []
 
-# =========================
+# ===============================================================================================================================================
 #  Request / Response Models
-# =========================
+# ===============================================================================================================================================
 
 class PredictRequest(BaseModel):
     text: Optional[str] = Field(default=None, description="Single input text")
@@ -156,9 +134,9 @@ class PredictBatchResponse(BaseModel):
     results: List[PredictResponse]
     meta: Dict[str, object]
 
-# =========================
+# ===============================================================================================================================================
 #  Utility: security
-# =========================
+# ===============================================================================================================================================
 
 def require_bearer_token(request: Request) -> None:
     if not API_BEARER_TOKEN:
@@ -170,9 +148,9 @@ def require_bearer_token(request: Request) -> None:
     if token != API_BEARER_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-# =========================
+# ===============================================================================================================================================
 #  Utility: preprocessing
-# =========================
+# ===============================================================================================================================================
 
 def normalize_text(s: str) -> str:
     s = unicodedata.normalize("NFKC", s)
@@ -186,9 +164,9 @@ def enforce_char_limit(s: str) -> str:
         s = s[:MAX_CHARS]
     return s
 
-# =========================
+# ===============================================================================================================================================
 #  Thresholds & strictness
-# =========================
+# ===============================================================================================================================================
 
 def load_base_thresholds() -> Dict[str, float]:
     if not os.path.exists(THRESHOLDS_PATH):
@@ -213,13 +191,12 @@ def compute_verdict(scores: Dict[str, float], thresholds: Dict[str, float]) -> T
     triggered = [k for k in LABELS if float(scores.get(k, 0.0)) >= float(thresholds[k])]
     return (len(triggered) > 0), triggered
 
-# =========================
+# ===============================================================================================================================================
 #  Model loading & inference
-# =========================
+# ===============================================================================================================================================
 
 _tokenizer: Optional[AutoTokenizer] = None
 _model: Optional[AutoModelForSequenceClassification] = None
-
 def _resolve_device() -> str:
     # Called only in background thread.
     if REQUESTED_DEVICE in ("cpu",):
@@ -243,13 +220,11 @@ def load_model() -> None:
             pass
 
     _tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_PATH, use_fast=True)
-
     config = AutoConfig.from_pretrained(HF_MODEL_PATH)
     config.num_labels = len(LABELS)
     config.problem_type = "multi_label_classification"
     config.id2label = {i: LABELS[i] for i in range(len(LABELS))}
     config.label2id = {LABELS[i]: i for i in range(len(LABELS))}
-
     _model = AutoModelForSequenceClassification.from_pretrained(
         HF_MODEL_PATH,
         config=config,
@@ -273,14 +248,12 @@ def load_model() -> None:
 def predict_scores(texts: List[str]) -> List[Dict[str, float]]:
     if _tokenizer is None or _model is None:
         raise RuntimeError("Model not loaded yet")
-
     tok_kwargs = dict(
         padding=True,
         truncation=True,
         max_length=MAX_TOKENS,
         return_tensors="pt",
     )
-    # Small GPU perf win
     if DEVICE == "cuda":
         tok_kwargs["pad_to_multiple_of"] = 8
 
@@ -298,7 +271,6 @@ def predict_scores(texts: List[str]) -> List[Dict[str, float]]:
         logits = _model(**enc).logits
 
     probs = torch.sigmoid(logits).detach().cpu().tolist()
-
     results: List[Dict[str, float]] = []
     for row in probs:
         row = list(row)
@@ -317,15 +289,15 @@ def warmup_model() -> None:
     except Exception as e:
         print(f"[warmup] failed: {e}")
 
-# =========================
+# ===============================================================================================================================================
 #  Startup: load in BACKGROUND
-# =========================
+# ===============================================================================================================================================
 
 def _load_in_background():
     global MODEL_READY, MODEL_ERROR
     try:
         load_model()
-        MODEL_READY = True  # become ready immediately after load
+        MODEL_READY = True 
 
         if ENABLE_WARMUP:
             warmup_model()
@@ -340,9 +312,9 @@ def _load_in_background():
 def _startup() -> None:
     threading.Thread(target=_load_in_background, daemon=True).start()
 
-# =========================
+# ===============================================================================================================================================
 #  Endpoints
-# =========================
+# ===============================================================================================================================================
 
 @app.get("/health")
 def health():
@@ -386,16 +358,13 @@ def stats():
 @app.post("/predict", response_model=PredictResponse)
 async def predict(req: PredictRequest, request: Request):
     global LAT_COUNT, LAT_TOTAL_SUM, LAT_MODEL_SUM, LAT_LAST_200_TOTAL, LAT_LAST_200_MODEL
-
     require_bearer_token(request)
     require_ready()
-
     if req.text is None and (req.texts is None or len(req.texts) == 0):
         raise HTTPException(status_code=400, detail="Provide 'text' or 'texts'")
 
     strictness = float(req.strictness or 0.5)
     thr = thresholds_for_strictness(strictness)
-
     if req.text is not None:
         texts_in = [req.text]
     else:
@@ -406,17 +375,14 @@ async def predict(req: PredictRequest, request: Request):
         texts_in = [req.texts[0]]
 
     processed = [normalize_text(enforce_char_limit(t)) for t in texts_in]
-
     t_total_start = time.perf_counter()
     t_model_start = time.perf_counter()
-
     scores_list = predict_scores(processed)
     if DEVICE == "cuda":
         torch.cuda.synchronize()
 
     model_latency_ms = int((time.perf_counter() - t_model_start) * 1000)
     total_latency_ms = int((time.perf_counter() - t_total_start) * 1000)
-
     LAT_COUNT += 1
     LAT_TOTAL_SUM += total_latency_ms
     LAT_MODEL_SUM += model_latency_ms
@@ -424,10 +390,8 @@ async def predict(req: PredictRequest, request: Request):
     LAT_LAST_200_MODEL.append(model_latency_ms)
     LAT_LAST_200_TOTAL = LAT_LAST_200_TOTAL[-200:]
     LAT_LAST_200_MODEL = LAT_LAST_200_MODEL[-200:]
-
     scores = scores_list[0]
     is_toxic, triggered = compute_verdict(scores, thr)
-
     return PredictResponse(
         scores=scores,
         verdict=Verdict(is_toxic=is_toxic, triggered_labels=triggered),
@@ -447,10 +411,8 @@ async def predict(req: PredictRequest, request: Request):
 @app.post("/predict_batch", response_model=PredictBatchResponse)
 async def predict_batch(req: PredictRequest, request: Request):
     global LAT_COUNT, LAT_TOTAL_SUM, LAT_MODEL_SUM, LAT_LAST_200_TOTAL, LAT_LAST_200_MODEL
-
     require_bearer_token(request)
     require_ready()
-
     if not req.texts or len(req.texts) == 0:
         raise HTTPException(status_code=400, detail="Provide 'texts' (non-empty)")
 
@@ -459,19 +421,15 @@ async def predict_batch(req: PredictRequest, request: Request):
 
     strictness = float(req.strictness or 0.5)
     thr = thresholds_for_strictness(strictness)
-
     processed = [normalize_text(enforce_char_limit(t)) for t in req.texts]
-
     t_total_start = time.perf_counter()
     t_model_start = time.perf_counter()
-
     scores_list = predict_scores(processed)
     if DEVICE == "cuda":
         torch.cuda.synchronize()
 
     model_latency_ms = int((time.perf_counter() - t_model_start) * 1000)
     total_latency_ms = int((time.perf_counter() - t_total_start) * 1000)
-
     LAT_COUNT += 1
     LAT_TOTAL_SUM += total_latency_ms
     LAT_MODEL_SUM += model_latency_ms
@@ -479,7 +437,6 @@ async def predict_batch(req: PredictRequest, request: Request):
     LAT_LAST_200_MODEL.append(model_latency_ms)
     LAT_LAST_200_TOTAL = LAT_LAST_200_TOTAL[-200:]
     LAT_LAST_200_MODEL = LAT_LAST_200_MODEL[-200:]
-
     results: List[PredictResponse] = []
     for scores in scores_list:
         is_toxic, triggered = compute_verdict(scores, thr)
