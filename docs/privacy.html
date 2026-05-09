@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Privacy Policy — Toxic Text Detector</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;line-height:1.55}
+    h1,h2{line-height:1.2}
+    code{background:#f3f3f3;padding:2px 6px;border-radius:6px}
+    .muted{color:#666}
+  </style>
+</head>
+<body>
+  <h1>Privacy Policy — Toxic Text Detector</h1>
+  <p class="muted">Last updated: 2026-05-09</p>
+
+  <h2>Overview</h2>
+  <p>
+    Toxic Text Detector is a Chrome extension that helps users detect potentially toxic text on web pages.
+    The extension works in a <strong>local-by-default</strong> mode and may optionally use a <strong>remote API</strong>
+    if the user enables it in settings.
+  </p>
+
+  <h2>Data We Process</h2>
+  <ul>
+    <li>
+      <strong>Website content (page text):</strong> The extension reads visible text from the current page in order to analyze it for toxicity.
+      This text is processed to produce toxicity scores and UI feedback (e.g., highlighting/blur).
+    </li>
+    <li>
+      <strong>Extension settings:</strong> We store user configuration (e.g., strictness, enabled labels, selected mode, UI preferences) using Chrome storage.
+    </li>
+    <li>
+      <strong>Optional API token:</strong> If the user enables remote mode and provides a token, the token is stored in Chrome storage and sent only to the configured API endpoint for authentication.
+    </li>
+  </ul>
+
+  <h2>What We Do NOT Collect</h2>
+  <ul>
+    <li>No names, email addresses, phone numbers, or other direct identifiers</li>
+    <li>No payment or financial information</li>
+    <li>No passwords or authentication data (other than the optional API token you provide)</li>
+    <li>No location data</li>
+    <li>No web browsing history tracking</li>
+    <li>No sale of user data</li>
+  </ul>
+
+  <h2>Local Mode (Default)</h2>
+  <p>
+    In local mode, text analysis happens on your device in the browser. Page text is not sent to any server.
+  </p>
+
+  <h2>Remote Mode (Optional)</h2>
+  <p>
+    If you enable remote mode, the extension sends the text you choose to analyze to the remote API endpoint you configured
+    (for example, a Cloud Run service). The API returns toxicity scores.
+  </p>
+  <p>
+    The remote API is designed to process text <strong>in memory</strong> for inference and return results.
+    It is not intended to store the submitted text. Basic operational logs may exist (e.g., request timing/status),
+    but the service is not designed to persist page content as a dataset.
+  </p>
+
+  <h2>How We Use the Data</h2>
+  <ul>
+    <li>To provide toxicity detection and display results in the extension UI</li>
+    <li>To save your preferences so the extension works consistently across sessions</li>
+    <li>To authenticate requests to the remote API if you enabled remote mode and configured a token</li>
+  </ul>
+
+  <h2>Data Sharing</h2>
+  <p>
+    We do not sell user data. We do not share user data with third parties for advertising or profiling.
+    If you enable remote mode, text is sent only to the API endpoint you configured for inference.
+  </p>
+
+  <h2>Data Retention</h2>
+  <ul>
+    <li>Extension settings and optional token are stored until you change them or uninstall the extension.</li>
+    <li>Page text is processed for analysis and not intended to be stored permanently.</li>
+  </ul>
+
+  <h2>Security</h2>
+  <p>
+    Remote requests use HTTPS when configured with an HTTPS endpoint.
+    You can keep remote mode disabled to ensure processing stays fully local.
+  </p>
+
+  <h2>Your Choices</h2>
+  <ul>
+    <li>Use local mode (default) to avoid sending text to any server.</li>
+    <li>Enable/disable remote mode at any time in extension settings.</li>
+    <li>Remove the API token from settings at any time.</li>
+    <li>Uninstall the extension to remove stored settings from your browser.</li>
+  </ul>
+
+  <h2>Contact</h2>
+  <p>
+    If you have questions about this policy, contact the developer at:
+    <br />
+    <code>vladstahov5@gmail.com</code>
+  </p>
+</body>
+</html>
