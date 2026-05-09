@@ -1,9 +1,7 @@
-# --- datasets / generated outputs ---
 data/raw/
 data/processed/
 reports/
 
-# --- python cache / env ---
 __pycache__/
 *.pyc
 .venv/
@@ -11,7 +9,8 @@ venv/
 .env
 *.log
 
-# --- HF training artifacts ---
+jig/
+
 models/**/checkpoint-*/
 models/**/optimizer.pt
 models/**/scheduler.pt
@@ -19,7 +18,6 @@ models/**/trainer_state.json
 models/**/rng_state.pth
 models/**/*.pt
 
-# --- keep only the final model folder (optional but recommended) ---
 models/*
 !models/xlmr-toxic-v2_1/
 !models/xlmr-toxic-v2_1/**
